@@ -2,6 +2,16 @@
 
 # Poly/ML
 
+> **This fork adds flame graphs.** Poly/ML's time profiler returns a flat list
+> of `(count, name)` pairs, and on macOS/Apple Silicon it did not work at all.
+> This fork records whole call stacks and writes them in the folded format
+> `flamegraph.pl` and speedscope read, so you can see what was *calling* a hot
+> function. It is inert unless you set `POLY_PROFILE_OUT`.
+>
+> **See [PROFILING.md](PROFILING.md)** — including how to flame-graph a
+> complete HOL4 build, not just one theory at a time.
+
+
 Poly/ML is a Standard ML implementation originally written in an experimental
 language called [Poly](http://www.polyml.org/Doc.html#poly). It has been fully compatible with the [ML97 standard](http://sml-family.org/sml97-defn.pdf)
 since version 4.0. For a full history, see [here](http://www.polyml.org/FAQ.html#history).
