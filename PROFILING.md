@@ -31,6 +31,12 @@ Two environment variables:
 | `POLY_PROFILE_OUT=<path>` | profile from RTS startup to shutdown, write the result to `<path>`. `%p` in the path expands to the process id. |
 | `POLY_PROFILE_STACKS=1` | record whole call stacks rather than just the function each sample landed in. |
 
+> **Create the output directory first.** `POLY_PROFILE_OUT` is opened with
+> `fopen`, which does not create directories, and a failure to open it is
+> currently silent — you get no file and no error. If you point it at
+> `/tmp/p/%p.folded` without `mkdir -p /tmp/p`, a build will sample happily
+> for an hour and write nothing.
+
 ```sh
 POLY_PROFILE_STACKS=1 POLY_PROFILE_OUT=/tmp/prof.folded \
     $HOME/.local/polyml/bin/poly < myscript.sml
@@ -67,10 +73,12 @@ whether a `.folded` file appears.
 ### 2a. One theory
 
 ```sh
+mkdir -p /tmp/p                            # or nothing is written
 cd src/real/analysis
 rm -f .hol/objs/real_topologyTheory.*      # force a rebuild
 POLY_PROFILE_STACKS=1 POLY_PROFILE_OUT=/tmp/p/%p.folded \
     ../../../bin/Holmake real_topologyTheory.uo
+ls /tmp/p                                  # check: files should be here
 ```
 
 ### 2b. The whole build
@@ -78,11 +86,15 @@ POLY_PROFILE_STACKS=1 POLY_PROFILE_OUT=/tmp/p/%p.folded \
 Yes — this works, and it is the interesting case.
 
 ```sh
+mkdir -p /tmp/p                            # or nothing is written
 cd /path/to/HOL
 bin/build cleanAll
 POLY_PROFILE_STACKS=1 POLY_PROFILE_OUT=/tmp/p/%p.folded \
     bin/build < /dev/null
 ```
+
+Check `/tmp/p` has files in it before walking away from a long build — a
+five second `ls` beats discovering an hour later that nothing was recorded.
 
 A build is made of many short-lived Poly/ML processes — a theory builder per
 theory, plus Holmake itself and the heap builds — and that is exactly what
