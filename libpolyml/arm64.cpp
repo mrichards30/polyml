@@ -30,6 +30,8 @@
 
 #ifdef HAVE_ASSERT_H
 #include <assert.h>
+#include <signal.h>
+#include <stdlib.h>
 #define ASSERT(x) assert(x)
 #else
 #define ASSERT(x) 0
@@ -988,6 +990,15 @@ bool Arm64TaskData::AddTimeProfileCount(SIGNALCONTEXT *context)
 {
     stackItem* sp = 0;
     POLYCODEPTR pc = 0;
+    // On AArch64 the ML stack pointer is X28; the machine SP addresses the C
+    // stack, which is a different region entirely.  Stack walking has to use
+    // X28 or it scans unrelated memory (in practice it scans nothing, since
+    // the C stack sits above the heap-allocated ML stack).
+    stackItem* mlsp = 0;
+    // X30 (the link register).  A leaf function never spills its return
+    // address, so without this the caller of every leaf is invisible: 29% of
+    // samples in a HOL4 build came back as a bare leaf with no stack.
+    POLYCODEPTR lr = 0;
     if (context != 0)
     {
 #if defined(HAVE_WINDOWS_H)
@@ -999,8 +1010,113 @@ bool Arm64TaskData::AddTimeProfileCount(SIGNALCONTEXT *context)
         sp = (stackItem*)context->uc_mcontext.sp;
         pc = (POLYCODEPTR)context->uc_mcontext.pc;
 #endif
+#elif defined(__APPLE__) && defined(HOSTARCHITECTURE_AARCH64)
+        // macOS on Apple Silicon.  configure's ucontext_t probe fails here
+        // because <ucontext.h> refuses to compile without _XOPEN_SOURCE, so
+        // HAVE_UCONTEXT_T is undefined, SIGNALCONTEXT degrades to void and
+        // neither branch above is compiled.  The profiler then never extracts
+        // a pc, every sample misses, and time profiles are dominated by
+        // "unknown" with the remainder biased towards threads that happen to
+        // be inside an RTS call (the assemblyInterface.stackPtr fallback
+        // below).  ucontext_t itself is perfectly available via <signal.h>.
+        {
+            const ucontext_t *uc = (const ucontext_t *)context;
+#if defined(__DARWIN_OPAQUE_ARM_THREAD_STATE64) && __DARWIN_OPAQUE_ARM_THREAD_STATE64
+            pc = (POLYCODEPTR)arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+            sp = (stackItem*)arm_thread_state64_get_sp(uc->uc_mcontext->__ss);
+#else
+            pc = (POLYCODEPTR)uc->uc_mcontext->__ss.__pc;
+            sp = (stackItem*)uc->uc_mcontext->__ss.__sp;
+#endif
+            mlsp = (stackItem*)uc->uc_mcontext->__ss.__x[28];
+            lr = (POLYCODEPTR)uc->uc_mcontext->__ss.__lr;
+        }
 #endif
     }
+    // Attribute the sample to the calling function rather than the sampled
+    // one when POLY_PROFILE_CALLERS is set.  Poly/ML's profile is otherwise
+    // flat: hot shared leaves (List.filter, HOLset operations) cannot be
+    // acted on because there is no way to see who is calling them.  Running a
+    // workload twice, once each way, and diffing the two profiles gives that.
+    if (profileStacksWanted() && pc != 0)
+    {
+        // Conservative scan of the ML stack: the sampled pc, then plausible
+        // return addresses, leaf first.  Folded by the main thread into
+        // "leaf;caller;caller2" counts, which is flamegraph.pl's input format.
+        POLYCODEPTR frames[STACK_MAXDEPTH];
+        int nf = 0;
+        frames[nf++] = pc;
+        if (lr != 0 && lr != pc)
+        {
+            MemSpace *lspace = gMem.SpaceForAddress(lr);
+            if (lspace != 0 && (lspace->spaceType == ST_CODE ||
+                                lspace->spaceType == ST_PERMANENT))
+                frames[nf++] = lr;
+        }
+        stackItem *q = mlsp;
+        stackItem *stackTop = (stackItem*)this->stack->top;
+        if (q == 0 || q < (stackItem*)this->stack->bottom || q >= stackTop)
+            q = stackTop; // not in this task's stack: record the leaf alone
+        // Deeply non-tail-recursive basis functions (List.filter, append) put
+        // thousands of their own return addresses on the stack; a short scan
+        // never reaches the caller and they look like roots.  Consecutive
+        // duplicates are folded later, so a long scan still yields a short
+        // stack - it just has to look far enough.
+        for (int i = 0; i < 16384 && q < stackTop && nf < STACK_MAXDEPTH; i++, q++)
+        {
+            // SpaceForAddress walks a byte-indexed B-tree - about eight
+            // dependent loads - and most stack words are tagged integers or
+            // unaligned junk that cannot be a return address.  Rejecting
+            // those first keeps the scan's cost off the sampled thread,
+            // which matters because the thread is suspended while we walk
+            // it: an expensive scan makes deeply recursive code look more
+            // costly than it is.
+            if (q->w().IsTagged()) continue;
+            POLYCODEPTR ra = q->w().AsCodePtr();
+            if (((uintptr_t)ra & (sizeof(PolyWord) - 1)) != 0) continue;
+            MemSpace *rspace = gMem.SpaceForAddress(ra);
+            if (rspace == 0 ||
+                (rspace->spaceType != ST_CODE && rspace->spaceType != ST_PERMANENT))
+                continue;
+            // Compare against the last few frames, not just the previous one.
+            // A self-recursive function with two call sites pushes return
+            // addresses that alternate, so a one-deep check never folds them
+            // and the frame budget is spent on the callee's own recursion
+            // before the scan reaches its caller.  That is what made
+            // List.filter and friends look like roots.
+            bool seen = false;
+            for (int k = nf - 1; k >= 0 && k >= nf - 8; k--)
+                if (frames[k] == ra) { seen = true; break; }
+            if (!seen) frames[nf++] = ra;
+        }
+        recordStackSample(frames, nf);
+        return true;
+    }
+
+    static int callerMode = -1;
+    if (callerMode < 0)
+        callerMode = (getenv("POLY_PROFILE_CALLERS") != 0) ? 1 : 0;
+
+    if (callerMode && pc != 0 && sp != 0)
+    {
+        // Scan up the stack for the first word that is a plausible return
+        // address into ML code, and charge the sample to that instead.
+        stackItem *q = sp;
+        stackItem *stackTop = (stackItem*)this->stack->top;
+        for (int i = 0; i < 128 && q < stackTop; i++, q++)
+        {
+            POLYCODEPTR ra = q->w().AsCodePtr();
+            MemSpace *rspace = gMem.SpaceForAddress(ra);
+            if (rspace != 0 &&
+                (rspace->spaceType == ST_CODE || rspace->spaceType == ST_PERMANENT) &&
+                ra != pc)
+            {
+                incrementCountAsynch(ra);
+                return true;
+            }
+        }
+    }
+
     if (pc != 0)
     {
         // See if the PC we've got is an ML code address.
@@ -1011,6 +1127,15 @@ bool Arm64TaskData::AddTimeProfileCount(SIGNALCONTEXT *context)
             return true;
         }
     }
+    // The two fallbacks below guess at a return address on the stack.  They
+    // exist for platforms where the pc cannot be read from the signal context
+    // at all.  When we *do* have a pc and it simply is not ML code (we were in
+    // the RTS or a syscall), guessing produces stale attributions - it was
+    // charging syscall time to whichever ML frame happened to be below, e.g.
+    // 10% of a theory's profile landing on BasicStreamIO.flushOut when the
+    // real cost of output was measured at under 1%.  Prefer an honest miss.
+    if (pc != 0) { recordRTSSample(pc); return false; }
+
     // See if the sp value is in the current stack.
     if (sp >= (stackItem*)this->stack->bottom && sp < (stackItem*)this->stack->top)
     {

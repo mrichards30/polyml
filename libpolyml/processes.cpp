@@ -110,6 +110,15 @@
 #include "arb.h"
 #include "machine_dep.h"
 #include "diagnostics.h"
+#if defined(__APPLE__) && defined(HOSTARCHITECTURE_AARCH64) && !defined(HAVE_WINDOWS_H)
+#define MACOSX_MACH_PROFILER 1
+#include <mach/mach.h>
+#include <pthread.h>
+// <ucontext.h> refuses to compile without _XOPEN_SOURCE, but <signal.h>
+// declares ucontext_t anyway; arm64.cpp relies on the same thing.
+#include <signal.h>
+#endif
+
 #include "processes.h"
 #include "run_time.h"
 #include "sys.h"
@@ -243,6 +252,10 @@ public:
 #else
     // Unix: Start a profile timer for a thread.
     void StartProfilingTimer(void);
+#endif
+#if defined(MACOSX_MACH_PROFILER)
+    // macOS: take one round of samples from the running ML threads.
+    void MachProfileTick(void);
 #endif
     // Memory allocation.  Tries to allocate space.  If the allocation succeeds it
     // may update the allocation values in the taskData object.  If the heap is exhausted
@@ -1837,6 +1850,125 @@ DWORD WINAPI ProfilingTimer(LPVOID parm)
 #endif
 
 // Profiling control.  Called by the root thread.
+#if defined(MACOSX_MACH_PROFILER)
+// macOS delivers ITIMER_VIRTUAL signals almost entirely at syscall-return
+// boundaries.  Measured on a HOL4 workload, 45% of all samples landed on the
+// single address __mmap+8 with no ML stack under them, and the ML samples
+// that did arrive were whatever happened to be running at a kernel
+// transition.  Sample with a dedicated thread instead: it reads PC and X28
+// straight out of each ML thread with thread_get_state, which is neither
+// biased towards syscalls nor limited to them.
+//
+// Discipline: registers are copied while the target is suspended, but the
+// target is resumed before the sample is processed.  Processing takes locks
+// (the profile queue, the code bitmaps) that a suspended ML thread could be
+// holding, so doing it the other way round deadlocks.
+static bool machProfileRunning = false;
+static pthread_t machProfileThread;
+
+static void *machProfileMain(void *arg)
+{
+    Processes *procs = (Processes *)arg;
+    while (machProfileRunning)
+    {
+        struct timespec ts = { 0, 1000000 }; // 1ms
+        nanosleep(&ts, NULL);
+        if (!machProfileRunning) break;
+        procs->MachProfileTick();
+    }
+    return 0;
+}
+
+void Processes::MachProfileTick(void)
+{
+    if (profileMode != kProfileTime) return;
+
+    // While the RTS is doing something on behalf of everyone - a GC, mostly -
+    // the ML threads are stopped, so sampling them would record nothing and
+    // GC time would simply disappear from the profile.  Charge the tick to
+    // the phase instead, which is what the signal handler did.
+    if (mainThreadPhase != MTP_USER_CODE)
+    {
+        handleProfileTrap(0, 0);
+        return;
+    }
+
+    // Hold schedLock so the task array is stable and no GC can start under
+    // us: the stack we are about to walk belongs to a thread that is either
+    // running ML or stopped, not one being scanned by a collector.
+    struct { TaskData *taskData; arm_thread_state64_t state; }
+        samples[16];
+    unsigned nSamples = 0;
+    {
+        PLocker lock(&schedLock);
+        for (std::vector<TaskData*>::iterator i = taskArray.begin();
+             i != taskArray.end() && nSamples < 16; i++)
+        {
+            TaskData *taskData = *i;
+            if (taskData == 0) continue;
+            mach_port_t port = pthread_mach_thread_np(taskData->threadId);
+            if (port == MACH_PORT_NULL) continue;
+
+            // Only count a thread that is actually on a CPU.  Counting
+            // blocked threads would reintroduce the bias we are removing,
+            // just with a different shape.
+            thread_basic_info_data_t info;
+            mach_msg_type_number_t infoCount = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info,
+                            &infoCount) != KERN_SUCCESS)
+                continue;
+            if (info.run_state != TH_STATE_RUNNING) continue;
+            if (info.flags & TH_FLAGS_IDLE) continue;
+
+            if (thread_suspend(port) != KERN_SUCCESS) continue;
+            mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+            kern_return_t kr =
+                thread_get_state(port, ARM_THREAD_STATE64,
+                                 (thread_state_t)&samples[nSamples].state,
+                                 &count);
+            if (kr == KERN_SUCCESS && profileStacksWanted())
+            {
+                // Walking the ML stack has to happen while the thread is
+                // still stopped.  Let it run and it can grow - and so move -
+                // its stack while the scan is part way up it, and the scan
+                // then reads freed memory; with a deep scan that is frequent
+                // enough to crash the build.  The stack path is lock-free
+                // (the sample goes into a ring buffer with an atomic index),
+                // so it is safe to do here; only the *processing* of samples
+                // needs the thread running again.
+                _STRUCT_MCONTEXT64 mc;
+                memset(&mc, 0, sizeof(mc));
+                mc.__ss = samples[nSamples].state;
+                ucontext_t uc;
+                memset(&uc, 0, sizeof(uc));
+                uc.uc_mcontext = &mc;
+                handleProfileTrap(taskData, (SIGNALCONTEXT *)&uc);
+                thread_resume(port);
+                continue;
+            }
+            thread_resume(port);
+            if (kr != KERN_SUCCESS) continue;
+            samples[nSamples].taskData = taskData;
+            nSamples++;
+        }
+    }
+
+    // Present each sample as if it had arrived through a signal: arm64.cpp
+    // reads uc_mcontext->__ss and nothing else, so a context built here is
+    // indistinguishable from a real one.
+    for (unsigned s = 0; s < nSamples; s++)
+    {
+        _STRUCT_MCONTEXT64 mc;
+        memset(&mc, 0, sizeof(mc));
+        mc.__ss = samples[s].state;
+        ucontext_t uc;
+        memset(&uc, 0, sizeof(uc));
+        uc.uc_mcontext = &mc;
+        handleProfileTrap(samples[s].taskData, (SIGNALCONTEXT *)&uc);
+    }
+}
+#endif
+
 void Processes::StartProfiling(void)
 {
 #ifdef HAVE_WINDOWS_H
@@ -1870,10 +2002,25 @@ void Processes::StartProfiling(void)
     }
     StartProfilingTimer(); // Start the timer in the root thread.
 #endif
+#if defined(MACOSX_MACH_PROFILER)
+    if (!machProfileRunning)
+    {
+        machProfileRunning = true;
+        if (pthread_create(&machProfileThread, NULL, machProfileMain, this) != 0)
+            machProfileRunning = false;
+    }
+#endif
 }
 
 void Processes::StopProfiling(void)
 {
+#if defined(MACOSX_MACH_PROFILER)
+    if (machProfileRunning)
+    {
+        machProfileRunning = false;
+        pthread_join(machProfileThread, NULL);
+    }
+#endif
 #ifdef HAVE_WINDOWS_H
     if (hStopEvent) SetEvent(hStopEvent);
     // Wait for the thread to stop
@@ -1962,6 +2109,12 @@ void Processes::Init(void)
 // On Linux, at least, each thread needs to run this.
 void Processes::StartProfilingTimer(void)
 {
+#if defined(MACOSX_MACH_PROFILER)
+    // The Mach sampler replaces the timer here rather than supplementing it;
+    // running both just adds the signal path's syscall-boundary samples back
+    // into the profile.
+    return;
+#endif
     // set virtual timer to go off every millisecond
     struct itimerval starttime;
     starttime.it_interval.tv_sec = starttime.it_value.tv_sec = 0;

@@ -49,6 +49,14 @@ extern void handleProfileTrap(TaskData *taskData, SIGNALCONTEXT *context);
 extern void addSynchronousCount(POLYCODEPTR pc, POLYUNSIGNED incr);
 // Add one to the timing counter.  May occur at any time.
 extern void incrementCountAsynch(POLYCODEPTR pc);
+// Record a sample whose pc is outside ML code (RTS/C).  Signal-safe: just
+// queues the raw address; it is symbolised with dladdr when the queue drains.
+extern void recordRTSSample(POLYCODEPTR pc);
+// Record a whole call stack (leaf first).  Signal-safe: copies raw addresses
+// into a ring buffer; they are resolved to names when the queue drains.
+#define STACK_MAXDEPTH 48
+extern void recordStackSample(POLYCODEPTR *pcs, int n);
+extern bool profileStacksWanted();
 // Process the queue of profile pc values if we're time profiling.
 // Only called by the main thread.
 extern void processProfileQueue();

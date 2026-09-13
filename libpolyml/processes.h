@@ -218,6 +218,12 @@ extern enum _mainThreadPhase {
     MTP_STOREMODULE,
     MTP_LOADMODULE,
     MTP_RELEASEMODULE,
+    // Diagnostic buckets: split what used to be lumped into MTP_USER_CODE
+    // ("UNKNOWN"), to say *why* a time sample could not be attributed.
+    MTP_UNATTR_NOTASK,    // signal was delivered to a non-ML thread (taskData==0)
+    MTP_UNATTR_NOMLPC,    // ML thread, but no ML pc in the context (in the RTS)
+    MTP_UNATTR_NOCODEOBJ, // pc was in an ML space but no code object found
+    MTP_UNATTR_NOPROFOBJ, // code object found but it carries no profile object
     MTP_MAXENTRY
 } mainThreadPhase;
 
