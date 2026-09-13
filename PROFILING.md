@@ -107,8 +107,16 @@ cat /tmp/p/*.folded | awk '
     END { for (k in c) print k, c[k] }' > merged.folded
 
 curl -O https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl
-perl flamegraph.pl merged.folded > build.svg
+perl flamegraph.pl --title "HOL4 build" --width 1600 merged.folded > build.svg
+
+open build.svg          # macOS; xdg-open on Linux
 ```
+
+`build.svg` is a self-contained file — open it in any browser, no server or
+tooling needed. It carries its own JavaScript: click a frame to zoom into it,
+Ctrl-F to search (matches are highlighted and the total is shown), and "Reset
+Zoom" to go back. Width is proportional to samples, so the widest boxes are
+where the time went; the vertical axis is stack depth, not time.
 
 `merged.folded` also loads directly into
 [speedscope](https://www.speedscope.app/) and the Firefox Profiler, both of
