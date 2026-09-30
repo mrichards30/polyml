@@ -1919,6 +1919,7 @@ struct
       let (* Single declaration - may declare several names. *)
         (* As well as entering the declarations we must keep a list
             of the value and exception declarations. *)
+         val acc = ref []
          val newEnv = 
            {
              lookupVal     = #lookupVal    env,
@@ -1927,26 +1928,23 @@ struct
              lookupStruct  = #lookupStruct env,
              lookupSig     = #lookupSig    env,
              lookupFunct   = #lookupFunct  env,
-             (* Must add the entries onto the end in case a declaration
-                with the same name is made. e.g.
-                   local ... in val a=1; val a=2 end. *)
              enterVal      =
                fn (pair as (_,v)) =>
                  (
                    #enterVal env pair;
-                   vars := !vars @ [CoreValue v]
+                   acc := (CoreValue v)::!acc
                  ),
              enterType     =
                fn (pair as (_,t)) =>
                  (
                    #enterType env pair;
-                   vars := !vars @ [CoreType t]
+                   acc := (CoreType t)::!acc
                  ),
              enterFix      =
                fn pair =>
                  (
                    #enterFix env pair;
-                   vars := !vars @ [CoreFix pair]
+                   acc := (CoreFix pair)::!acc
                  ),
              (* This will only be used if we do `open A' where A
                 contains sub-structures. *)
@@ -1954,7 +1952,7 @@ struct
                fn (pair as (_,v)) =>
                  (
                    #enterStruct env pair;
-                   vars := !vars @ [CoreStruct v]
+                   acc := (CoreStruct v)::!acc
                  ), 
              enterSig      = #enterSig     env,
              enterFunct    = #enterFunct   env,
@@ -1974,7 +1972,10 @@ struct
             (* Process the body and discard the type. *)
             val _ = PARSETREE.pass2 (dec, makeId, Env newEnv, lex, fn _ => false)
        in
-         ()
+           (* Must add the entries onto the end in case a declaration
+                with the same name is made. e.g.
+                local ... in val a=1; val a=2 end (hence reversing acc.) *)
+           vars := !vars @ List.rev (!acc)
        end (* pass2Singleton *)
 
         fun pass2Dec (str as StructureDec { bindings, typeIdsForDebug, ... }) =
